@@ -9,18 +9,19 @@ RUN apt-get update && apt-get install -y \
     libxslt-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Upgrade pip first and disable hash checking
+RUN pip install --upgrade pip
 
-# Install Python dependencies directly (without upgrading pip)
-# Install each package separately to avoid hash verification issues
-RUN pip install --no-cache-dir flask==2.3.3 && \
-    pip install --no-cache-dir flask-cors==4.0.0 && \
-    pip install --no-cache-dir pyserial==3.5 && \
-    pip install --no-cache-dir requests==2.31.0 && \
-    pip install --no-cache-dir pymavlink==2.4.40 && \
-    pip install --no-cache-dir Werkzeug==2.3.7 && \
-    pip install --no-cache-dir Jinja2==3.1.2 && \
-    pip install --no-cache-dir MarkupSafe==2.1.3 && \
-    pip install --no-cache-dir itsdangerous==2.1.2
+# Install Python dependencies without hash verification
+RUN pip install --no-cache-dir --no-deps flask==2.3.3 && \
+    pip install --no-cache-dir --no-deps flask-cors==4.0.0 && \
+    pip install --no-cache-dir --no-deps pyserial==3.5 && \
+    pip install --no-cache-dir --no-deps requests==2.31.0 && \
+    pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org pymavlink==2.4.40 && \
+    pip install --no-cache-dir --no-deps Werkzeug==2.3.7 && \
+    pip install --no-cache-dir --no-deps Jinja2==3.1.2 && \
+    pip install --no-cache-dir --no-deps MarkupSafe==2.1.3 && \
+    pip install --no-cache-dir --no-deps itsdangerous==2.1.2
 
 # Create app directory
 WORKDIR /app
