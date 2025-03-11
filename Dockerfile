@@ -9,19 +9,23 @@ RUN apt-get update && apt-get install -y \
     libxslt-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip first and disable hash checking
+# Upgrade pip first
 RUN pip install --upgrade pip
 
-# Install Python dependencies without hash verification
-RUN pip install --no-cache-dir --no-deps flask==2.3.3 && \
-    pip install --no-cache-dir --no-deps flask-cors==4.0.0 && \
-    pip install --no-cache-dir --no-deps pyserial==3.5 && \
-    pip install --no-cache-dir --no-deps requests==2.31.0 && \
-    pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org pymavlink==2.4.40 && \
-    pip install --no-cache-dir --no-deps Werkzeug==2.3.7 && \
-    pip install --no-cache-dir --no-deps Jinja2==3.1.2 && \
-    pip install --no-cache-dir --no-deps MarkupSafe==2.1.3 && \
-    pip install --no-cache-dir --no-deps itsdangerous==2.1.2
+# Install core packages with their dependencies
+RUN pip install --no-cache-dir flask==2.3.3 \
+                             flask-cors==4.0.0 \
+                             pyserial==3.5 \
+                             requests==2.31.0 \
+                             Werkzeug==2.3.7 \
+                             Jinja2==3.1.2 \
+                             MarkupSafe==2.1.3 \
+                             itsdangerous==2.1.2 \
+                             click==8.1.7 \
+                             blinker==1.6.2
+
+# Install pymavlink separately with trusted hosts since it might have hash verification issues
+RUN pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org pymavlink==2.4.40
 
 # Create app directory
 WORKDIR /app
