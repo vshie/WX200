@@ -402,58 +402,65 @@ class WX200:
     def change_baud_rate(self, port, new_baud):
         """Change baud rate following the manual's sequence"""
         try:
-            # 1. Disable periodic transmissions at current baud rate
-            self.send_command("$PAMTX,0")
-            logger.info("Disabled periodic transmissions")
+            # Verify device is responding
+            ping_response = self.send_command("$PAMTC,QP")
+            if not ping_response:
+                logger.error("Device not responding at current baud rate")
+                return False
             
-            # 2. Send baud rate change command at current baud rate
-            self.send_command(f"$PAMTC,BAUD,{new_baud}")
+            # Step 1: Disable automatic transmissions before changing baud rate
+            # This uses the proper command format as specified in the manual
+            for message_type in ["GGA", "RMC", "HDT", "MWD", "MWVR", "VWR"]:
+                disable_cmd = f"$PAMTC,EN,{message_type},0"
+                self.send_command(disable_cmd)
+                logger.info(f"Disabled {message_type} transmissions")
+            
+            time.sleep(1)  # Wait for commands to take effect
+            
+            # Step 2: Send baud rate change command with proper checksum
+            # As specified in manual: "$PAMTC,BAUD,38400*hh<CR><LF>"
+            baud_cmd = f"$PAMTC,BAUD,{new_baud}"
+            self.send_command(baud_cmd)
             logger.info(f"Sent baud rate change command to {new_baud}")
             
-            # 3. Wait for any queued messages and ensure command is processed
-            time.sleep(2)
-            
-            # 4. Close port properly
+            # Step 3: Ensure all data is sent and close port
+            time.sleep(1)
             if self.serial_port:
-                self.serial_port.flush()  # Ensure all data is written
-                self.serial_port.close()
+                self.serial_port.flush()
+                old_port = self.serial_port
                 self.serial_port = None
+                old_port.close()
             
-            # 5. Wait for device to complete baud rate change
-            time.sleep(2)
+            # Step 4: Wait for device to process baud rate change
+            time.sleep(3)
             
-            # 6. Open new connection at new baud rate
+            # Step 5: Reopen port with new baud rate
+            logger.info(f"Reopening port at {new_baud} baud")
             try:
                 self.serial_port = serial.Serial(
                     port=port,
                     baudrate=new_baud,
-                    timeout=2,  # Increased timeout for stability
-                    write_timeout=2
+                    timeout=2
                 )
             except Exception as e:
                 logger.error(f"Failed to open port at new baud rate: {str(e)}")
+                # Fallback to original baud rate
+                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=1)
                 return False
             
-            # 7. Verify port is open
-            if not self.serial_port.is_open:
-                self.serial_port.open()
-            
-            # 8. Clear any buffered data
+            time.sleep(1)
             self.serial_port.reset_input_buffer()
             self.serial_port.reset_output_buffer()
             
-            # 9. Wait for device to stabilize at new rate
-            time.sleep(1)
-            
-            # 10. Re-enable periodic transmissions and verify communication
-            for _ in range(3):  # Try up to 3 times
-                response = self.send_command("$PAMTX,1")
-                if response and ('$' in response):  # Verify we got a valid NMEA response
-                    logger.info("Re-enabled periodic transmissions at new baud rate")
+            # Step 6: Verify communication at new baud rate
+            for attempt in range(3):
+                test_response = self.send_command("$PAMTC,QP")
+                if test_response and ('$' in test_response):
+                    logger.info(f"Device responding at {new_baud} baud: {test_response}")
                     return True
-                time.sleep(0.5)
+                time.sleep(1)
             
-            logger.error("Failed to re-enable transmissions at new baud rate")
+            logger.error(f"Device not responding at {new_baud} baud after multiple attempts")
             return False
             
         except Exception as e:
@@ -461,31 +468,42 @@ class WX200:
             return False
 
     def configure_device(self):
-        """Configure WX200 for optimal performance"""
+        """Configure WX200 for optimal performance using correct commands from manual"""
         if not self.connected:
             return False
         
         try:
-            # First disable all outputs while we configure
-            self.send_command("$PAMTX,0")
-            time.sleep(0.1)
-
-            # Configuration commands for WX200
-            commands = [
-                "$PAMTC,EN,ALL,1",  # Enable all sentences
-                "$PAMTC,OPTION,HEATERCTRL,1",  # Enable heater control if available
-                "$PAMTX,1,1",  # Enable true wind calculation
-                "$PAMTX,2,1",  # Enable apparent wind calculation
-                "$PAMTX,3,1",   # Enable theoretical wind calculation
-                "$PAMTX,0,1"  # Set fastest update rate - do this last
+            # Configure GPS message rates (10Hz maximum as specified in manual)
+            gps_commands = [
+                "$PAMTC,EN,GGA,0:0.10",  # GPS position
+                "$PAMTC,EN,RMC,0:0.10",  # GPS recommended minimum
+                "$PAMTC,EN,VTG,0:0.10"   # GPS track made good and speed
             ]
             
-            for cmd in commands:
+            # Configure compass heading message rates (10Hz maximum)
+            compass_commands = [
+                "$PAMTC,EN,HDG,0:0.10",  # Heading, deviation, variation
+                "$PAMTC,EN,HDT,0:0.10",  # Heading true
+                "$PAMTC,EN,THS,0:0.10"   # True heading and status
+            ]
+            
+            # Configure wind data message rates (10Hz maximum)
+            wind_commands = [
+                "$PAMTC,EN,MWD,0:0.10",  # Wind direction and speed
+                "$PAMTC,EN,MWVR,0:0.10", # Relative wind speed and angle
+                "$PAMTC,EN,VWR,0:0.10",  # Relative wind speed and angle
+                "$PAMTC,EN,VWT,0:0.10"   # True wind speed and angle
+            ]
+            
+            # Send all configuration commands with proper wait times
+            all_commands = gps_commands + compass_commands + wind_commands
+            
+            for cmd in all_commands:
                 response = self.send_command(cmd)
                 logger.info(f"Command: {cmd} -> Response: {response}")
-                time.sleep(0.1)  # Give device time to process each command
+                time.sleep(0.2)  # Give device time to process each command
                 
-            logger.info("Device configured for optimal performance")
+            logger.info("Device configured with optimal message rates")
             return True
             
         except Exception as e:
