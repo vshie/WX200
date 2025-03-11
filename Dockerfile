@@ -9,14 +9,6 @@ RUN apt-get update && apt-get install -y \
     libxslt-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
-WORKDIR /app
-
-# Create logs directory inside the container
-RUN mkdir -p /app/logs && chmod 777 /app/logs
-
-# Copy app files
-COPY . /app
 
 # Install Python dependencies directly (without upgrading pip)
 # Install each package separately to avoid hash verification issues
@@ -29,6 +21,15 @@ RUN pip install --no-cache-dir flask==2.3.3 && \
     pip install --no-cache-dir Jinja2==3.1.2 && \
     pip install --no-cache-dir MarkupSafe==2.1.3 && \
     pip install --no-cache-dir itsdangerous==2.1.2
+
+# Create app directory
+WORKDIR /app
+
+# Create logs directory inside the container
+RUN mkdir -p /app/logs && chmod 777 /app/logs
+
+# Copy app files
+COPY . /app
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
