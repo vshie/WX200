@@ -43,7 +43,11 @@ ENV FLASK_APP=main.py
 # Expose port for Flask
 EXPOSE 6567
 
-LABEL version="0.1"
+LABEL version="0.1.0"
+LABEL type="tool"
+LABEL icon="mdi-weather-windy"
+LABEL name="WX200 Weather Station"
+LABEL description="Interface for WX200 Weather Station"
 
 ARG IMAGE_NAME
 LABEL permissions='\

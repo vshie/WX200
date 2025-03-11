@@ -667,7 +667,7 @@ def get_data():
         "data": wx200.current_data
     })
 
-@app.route('/v1.0/register')
+@app.route('/register')
 def register_service():
     """Register the extension as a service in BlueOS."""
     return jsonify({
@@ -715,6 +715,18 @@ def index():
 def static_files(path):
     """Serve static files."""
     return send_from_directory('frontend', path)
+
+def register_with_blueos():
+    """Actively register with BlueOS at startup"""
+    try:
+        # Try to register with BlueOS core on localhost
+        response = requests.get("http://localhost:8080/register")
+        logger.info(f"BlueOS registration attempt: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Failed to register with BlueOS: {str(e)}")
+
+# Run the registration attempt in a separate thread at startup
+threading.Thread(target=register_with_blueos, daemon=True).start()
 
 if __name__ == '__main__':
     # Start the Flask app
