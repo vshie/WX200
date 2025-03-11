@@ -272,18 +272,24 @@ class WX200:
         return None
 
     def parse_nmea(self, line):
-        """Parse NMEA sentences from the device"""
+        """Parse NMEA sentences from the device with more robust error handling"""
         try:
-            if line.startswith('$'):
-                parts = line.split(',')
-                sentence_type = parts[0]
-                
-                # Store the raw data and timestamp
-                self.current_data['timestamp'] = time.time()
-                self.current_data['last_sentence'] = sentence_type
-                self.current_data['raw_data'] = line
-                
-                # Parse specific sentence types
+            if not line or not line.startswith('$'):
+                return
+            
+            parts = line.split(',')
+            if len(parts) < 2:  # Ensure we have at least a sentence type and one data field
+                return
+            
+            sentence_type = parts[0]
+            
+            # Store the raw data and timestamp
+            self.current_data['timestamp'] = time.time()
+            self.current_data['last_sentence'] = sentence_type
+            self.current_data['raw_data'] = line
+            
+            # Parse specific sentence types
+            try:
                 if sentence_type in ['$WIMWV', '$WIVWR']:  # Wind data
                     self.parse_wind_data(parts)
                     self.send_mavlink_wind()
@@ -301,6 +307,9 @@ class WX200:
                     self.send_mavlink_attitude()
                 elif sentence_type == '$GPZDA':  # Time & Date
                     self.parse_time_data(parts)
+            except Exception as specific_e:
+                # Log specific parsing error but continue with other sentences
+                logger.error(f"Error parsing {sentence_type}: {str(specific_e)}")
                 
         except Exception as e:
             logger.error(f"Parse error: {str(e)}")
@@ -521,43 +530,79 @@ class WX200:
             return False
         
         try:
+            # Make sure we can communicate first
+            query_response = self.send_command("$PAMTC,EN,Q")
+            logger.info(f"Current settings query: {query_response}")
+            
             # Step 1: Make sure transmissions are suspended for configuration
             self.send_command("$PAMTX,0")
             logger.info("Suspended all transmissions for configuration")
-            time.sleep(0.5)
+            time.sleep(1.0)  # Give more time to process
             
-            # Configure message rates with CORRECT format (10Hz = 1 tenth of a second)
+            # Force input buffer clear
+            self.serial_port.reset_input_buffer()
+            
+            # Use a more conservative rate (5Hz = interval of 2 in tenths of seconds)
             all_commands = [
-                # GPS message rates
-                "$PAMTC,EN,GGA,1,1",  # Enable GGA at 0.1s interval (10Hz)
-                "$PAMTC,EN,RMC,1,1",  # Enable RMC at 0.1s interval (10Hz)
-                "$PAMTC,EN,VTG,1,1",  # Enable VTG at 0.1s interval (10Hz)
+                # GPS message rates - more important data
+                "$PAMTC,EN,GGA,1,2",  # Enable at 0.2s interval (5Hz)
+                "$PAMTC,EN,RMC,1,2",  # Enable at 0.2s interval (5Hz)
                 
-                # Compass heading message rates
-                "$PAMTC,EN,HDG,1,1",  # Enable HDG at 0.1s interval (10Hz)
-                "$PAMTC,EN,HDT,1,1",  # Enable HDT at 0.1s interval (10Hz)
-                "$PAMTC,EN,THS,1,1",  # Enable THS at 0.1s interval (10Hz)
+                # Wind data - most important
+                "$PAMTC,EN,MWVR,1,2",  # Enable at 0.2s interval (5Hz)
                 
-                # Wind data message rates
-                "$PAMTC,EN,MWD,1,1",    # Enable MWD at 0.1s interval (10Hz)
-                "$PAMTC,EN,MWVR,1,1",   # Enable MWVR at 0.1s interval (10Hz)
-                "$PAMTC,EN,VWR,1,1",    # Enable VWR at 0.1s interval (10Hz)
-                "$PAMTC,EN,VWT,1,1"     # Enable VWT at 0.1s interval (10Hz)
+                # Less important data, slower rate
+                "$PAMTC,EN,VTG,1,5",   # 0.5s interval (2Hz)
+                "$PAMTC,EN,HDG,1,5",   # 0.5s interval (2Hz)
+                "$PAMTC,EN,HDT,1,5",   # 0.5s interval (2Hz)
+                "$PAMTC,EN,MWD,1,5",   # 0.5s interval (2Hz)
             ]
             
-            # Send all configuration commands
+            # Send commands with longer timeout and better error handling
             for cmd in all_commands:
-                response = self.send_command(cmd)
-                logger.info(f"Command: {cmd} -> Response: {response}")
-                time.sleep(0.5)  # Slightly longer delay between commands
+                for attempt in range(3):  # Try each command up to 3 times
+                    self.serial_port.reset_input_buffer()  # Clear any pending data
+                    response = self.send_command(cmd)
+                    logger.info(f"Command: {cmd} -> Response: {response}")
+                    
+                    # If we get a proper NMEA response (starts with $), consider it successful
+                    if response and response.startswith('$'):
+                        break
+                        
+                    time.sleep(1.0)  # Wait longer between retries
             
-            # Save settings to EEPROM so they persist through power cycles
-            save_response = self.send_command("$PAMTC,EN,S")
-            logger.info(f"Save settings command response: {save_response}")
+            # Save to EEPROM with multiple attempts
+            for attempt in range(3):
+                self.serial_port.reset_input_buffer()
+                save_response = self.send_command("$PAMTC,EN,S")
+                logger.info(f"Save settings (attempt {attempt+1}): {save_response}")
+                if save_response and save_response.startswith('$'):
+                    break
+                time.sleep(1.0)
             
-            # Step 2: Resume transmissions after configuration is complete
-            resume_response = self.send_command("$PAMTX,1")
-            logger.info(f"Resumed transmissions: {resume_response}")
+            # Resume transmissions with multiple attempts
+            for attempt in range(3):
+                resume_response = self.send_command("$PAMTX,1")
+                logger.info(f"Resume transmissions (attempt {attempt+1}): {resume_response}")
+                if resume_response and resume_response.startswith('$'):
+                    break
+                time.sleep(1.0)
+            
+            # Check if we're actually receiving data at the expected rate
+            logger.info("Waiting to verify data reception...")
+            time.sleep(3)
+            received_count = 0
+            start_time = time.time()
+            for _ in range(10):  # Check for data for 1 second
+                if self.serial_port.in_waiting > 0:
+                    response = self.serial_port.readline().decode('utf-8', errors='replace').strip()
+                    if response.startswith('$'):
+                        received_count += 1
+                        logger.info(f"Received: {response}")
+                time.sleep(0.1)
+            
+            rate = received_count / (time.time() - start_time)
+            logger.info(f"Receiving data at approximately {rate:.1f} Hz")
             
             return True
             
@@ -578,19 +623,32 @@ class WX200:
             
             self.default_port = port
             
-            # Initially connect at default baud rate
+            # Use 8-N-1 configuration explicitly
             logger.info(f"Connecting at initial baud rate: {self.DEFAULT_BAUD}")
             self.serial_port = serial.Serial(
                 port=port,
                 baudrate=self.DEFAULT_BAUD,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
                 timeout=1
             )
             time.sleep(0.5)
             
-            # Test communication at default baud with a simple query
-            test_response = self.send_command("$PAMTC,QP")
-            if not test_response:
-                logger.error("No response from device at default baud rate")
+            # Flush buffers at startup
+            self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
+            
+            # Try a few basic commands to establish communication
+            for _ in range(3):
+                test_response = self.send_command("$PAMTC,QP")
+                if test_response and not "ï¿½" in test_response:
+                    break
+                time.sleep(1)
+                self.serial_port.reset_input_buffer()
+            
+            if not test_response or "ï¿½" in test_response:
+                logger.error("No valid response from device at default baud rate")
                 self.disconnect()
                 return False
             
