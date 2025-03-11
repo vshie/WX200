@@ -141,35 +141,13 @@ class WX200:
         if 'meteorological' not in self.current_data:
             return
 
-        met = self.current_data['meteorological']
-        current_time = time.time()
-        if current_time - self.last_weather_send < self.weather_send_interval:
-            return
-
-        # Convert pressure to hPa/mbar if in different units
-        pressure = None
-        if met['barometric_pressure_bars'] is not None:
-            pressure = met['barometric_pressure_bars'] * 1000  # Convert bars to mbar
-        elif met['barometric_pressure_inches'] is not None:
-            pressure = met['barometric_pressure_inches'] * 33.8639  # Convert inHg to mbar
-
-        wind_speed = 0.0
-        wind_direction = 0.0
-        if 'wind' in self.current_data:
-            wind = self.current_data['wind']
-            if wind.get('status') == 'A':
-                wind_speed = float(wind['speed'])
-                wind_direction = float(wind['angle'])
-
-        self.mav.mav.weather_send(
-            temperature=float(met['air_temp_c']) if met['air_temp_c'] is not None else 0,
-            pressure=float(pressure) if pressure is not None else 0,
-            humidity=float(met['relative_humidity']) if met['relative_humidity'] is not None else 0,
-            wind_dir=wind_direction,
-            wind_speed=wind_speed,
-            wind_speed_z=0
-        )
-        self.last_weather_send = current_time
+        # Skip sending weather data since the MAVLink weather_send method isn't available
+        # Instead, log the weather data if desired
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Weather data available: {self.current_data['meteorological']}")
+        
+        # Update last_weather_send to prevent frequent logging attempts
+        self.last_weather_send = time.time()
 
     def send_mavlink_gps(self):
         """Send GPS data via MAVLink"""
@@ -181,46 +159,54 @@ class WX200:
         if current_time - self.last_gps_send < self.gps_send_interval:
             return
 
-        # Convert to appropriate units and types
-        lat = int(float(gps['latitude']) * 1e7)  # Convert to int32 degE7
-        lon = int(float(gps['longitude']) * 1e7)  # Convert to int32 degE7
-        alt = int(float(gps['altitude']) * 1000)  # Convert to mm
-        hdop = int(float(gps['hdop']) * 100) if 'hdop' in gps else 0
-        vdop = int(float(gps['vdop']) * 100) if 'vdop' in gps else 0
-        
-        # Convert speed to m/s if needed
-        speed = float(gps.get('speed', 0))
-        if gps.get('speed_units') == 'N':  # Knots
-            speed *= 0.514444
-        
-        # Get number of satellites
-        sats = int(gps.get('satellites', 0))
-        
-        # Determine fix type
-        fix_type = mavlink2.GPS_FIX_TYPE_NO_GPS
-        if gps.get('fix') == '1':
-            fix_type = mavlink2.GPS_FIX_TYPE_2D_FIX
-        elif gps.get('fix') == '2':
-            fix_type = mavlink2.GPS_FIX_TYPE_3D_FIX
-        
-        self.mav.mav.gps_raw_int_send(
-            time_usec=int(time.time() * 1e6),
-            fix_type=fix_type,
-            lat=lat,
-            lon=lon,
-            alt=alt,
-            eph=hdop,
-            epv=vdop,
-            vel=int(speed * 100),  # cm/s
-            cog=int(float(gps.get('track', 0)) * 100),  # cdeg
-            satellites_visible=sats,
-            alt_ellipsoid=alt,
-            h_acc=hdop,
-            v_acc=vdop,
-            vel_acc=0,
-            hdg_acc=0
-        )
-        self.last_gps_send = current_time
+        # Ensure all required fields exist
+        required_fields = ['latitude', 'longitude', 'altitude']
+        if not all(field in gps for field in required_fields):
+            return  # Skip sending if any required field is missing
+
+        try:
+            # Convert to appropriate units and types
+            lat = int(float(gps['latitude']) * 1e7)  # Convert to int32 degE7
+            lon = int(float(gps['longitude']) * 1e7)  # Convert to int32 degE7
+            alt = int(float(gps['altitude']) * 1000)  # Convert to mm
+            hdop = int(float(gps.get('hdop', 0)) * 100)
+            vdop = int(float(gps.get('vdop', 0)) * 100)
+            
+            # Convert speed to m/s if needed
+            speed = float(gps.get('speed', 0))
+            if gps.get('speed_units') == 'N':  # Knots
+                speed *= 0.514444
+            
+            # Get number of satellites
+            sats = int(gps.get('satellites', 0))
+            
+            # Determine fix type
+            fix_type = mavlink2.GPS_FIX_TYPE_NO_GPS
+            if gps.get('fix') == '1':
+                fix_type = mavlink2.GPS_FIX_TYPE_2D_FIX
+            elif gps.get('fix') == '2':
+                fix_type = mavlink2.GPS_FIX_TYPE_3D_FIX
+            
+            self.mav.mav.gps_raw_int_send(
+                time_usec=int(time.time() * 1e6),
+                fix_type=fix_type,
+                lat=lat,
+                lon=lon,
+                alt=alt,
+                eph=hdop,
+                epv=vdop,
+                vel=int(speed * 100),  # cm/s
+                cog=int(float(gps.get('track', 0)) * 100),  # cdeg
+                satellites_visible=sats,
+                alt_ellipsoid=alt,
+                h_acc=hdop,
+                v_acc=vdop,
+                vel_acc=0,
+                hdg_acc=0
+            )
+            self.last_gps_send = current_time
+        except Exception as e:
+            logger.error(f"Error sending MAVLink GPS data: {str(e)}")
 
     def send_mavlink_attitude(self):
         """Send compass heading as attitude data via MAVLink"""
@@ -367,23 +353,26 @@ class WX200:
                 if 'gps' not in self.current_data:
                     self.current_data['gps'] = {}
                 
-                # Convert DDMM.MMMM to decimal degrees
-                if parts[3] and parts[4] and parts[5] and parts[6]:
-                    lat = float(parts[3][:2]) + float(parts[3][2:]) / 60.0
-                    if parts[4] == 'S':
-                        lat = -lat
-                    lon = float(parts[5][:3]) + float(parts[5][3:]) / 60.0
-                    if parts[6] == 'W':
-                        lon = -lon
-                    
-                    self.current_data['gps'].update({
-                        'latitude': lat,
-                        'longitude': lon,
-                        'speed': float(parts[7]) if parts[7] else 0,
-                        'speed_units': 'N',  # Speed is in knots
-                        'track': float(parts[8]) if parts[8] else 0,
-                        'fix': '1' if parts[2] == 'A' else '0'
-                    })
+                # Only convert lat/long if all fields are present and non-empty
+                if parts[3] and parts[4] and parts[5] and parts[6] and parts[3] != '' and parts[5] != '':
+                    try:
+                        lat = float(parts[3][:2]) + float(parts[3][2:]) / 60.0
+                        if parts[4] == 'S':
+                            lat = -lat
+                        lon = float(parts[5][:3]) + float(parts[5][3:]) / 60.0
+                        if parts[6] == 'W':
+                            lon = -lon
+                        
+                        self.current_data['gps'].update({
+                            'latitude': lat,
+                            'longitude': lon,
+                            'speed': float(parts[7]) if parts[7] and parts[7] != '' else 0,
+                            'speed_units': 'N',  # Speed is in knots
+                            'track': float(parts[8]) if parts[8] and parts[8] != '' else 0,
+                            'fix': '1' if parts[2] == 'A' else '0'
+                        })
+                    except (ValueError, IndexError) as e:
+                        logger.error(f"Error converting GPS coordinates: {str(e)}")
         except Exception as e:
             logger.error(f"GPS RMC parse error: {str(e)}")
 
@@ -394,12 +383,20 @@ class WX200:
                 if 'gps' not in self.current_data:
                     self.current_data['gps'] = {}
                 
-                self.current_data['gps'].update({
-                    'altitude': float(parts[9]) if parts[9] else 0,
-                    'altitude_units': parts[10],
-                    'hdop': float(parts[8]) if parts[8] else 0,
-                    'satellites': int(parts[7]) if parts[7] else 0
-                })
+                # Safe conversion of values with error checking
+                try:
+                    altitude = float(parts[9]) if parts[9] and parts[9] != '' else 0
+                    hdop = float(parts[8]) if parts[8] and parts[8] != '' else 0
+                    satellites = int(parts[7]) if parts[7] and parts[7] != '' else 0
+                    
+                    self.current_data['gps'].update({
+                        'altitude': altitude,
+                        'altitude_units': parts[10] if parts[10] else 'M',
+                        'hdop': hdop,
+                        'satellites': satellites
+                    })
+                except ValueError as e:
+                    logger.error(f"Error converting GPS data values: {str(e)}")
         except Exception as e:
             logger.error(f"GPS GGA parse error: {str(e)}")
 
@@ -670,13 +667,13 @@ def get_data():
         "data": wx200.current_data
     })
 
-@app.route('/register_service')
+@app.route('/v1.0/register')
 def register_service():
     """Register the extension as a service in BlueOS."""
     return jsonify({
         "name": "WX200 Weather Station",
         "description": "Interface for WX200 Weather Station",
-        "icon": "mdi-windy-dust",
+        "icon": "mdi-weather-windy",
         "company": "Blue Robotics",
         "version": "0.1.0",
         "webpage": "",
@@ -708,6 +705,16 @@ def version():
         "version": "0.1.0",
         "name": "wx200"
     })
+
+@app.route('/')
+def index():
+    """Serve the main frontend page."""
+    return send_from_directory('frontend', 'index.html')
+
+@app.route('/<path:path>')
+def static_files(path):
+    """Serve static files."""
+    return send_from_directory('frontend', path)
 
 if __name__ == '__main__':
     # Start the Flask app
