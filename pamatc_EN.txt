@@ -1,0 +1,122 @@
+$PAMTC,EN
+Summary
+Enable or disable the periodic transmission of individual standard NMEA 0183
+sentences, and specify their rate of transmission.
+Syntax
+One of the following forms:
+$PAMTC,EN,<2>,<3>,<4>[,<5>]*hh<CR><LF>
+$PAMTC,EN,S*hh<CR><LF>
+$PAMTC,EN,L*hh<CR><LF>
+$PAMTC,EN,LD*hh<CR><LF>
+$PAMTC,EN,Q*hh<CR><LF>
+Fields
+<2> <3> The identifier ALL, or one of the following sentence ID’s:
+DTM, GGA, GLL, GSA, GSV, HDG, HDT, MDA,
+MWD, MWVR, MWVT, RMC, ROT, VTG, VWR, VWT,
+XDRA, XDRB, ZDA
+If field <2> is the ALL identifier, then
+0 = disable transmission of all sentences
+1 = enable transmission of all sentences.
+Otherwise,
+0 = disable transmission of the specified sentence
+1 = enable transmission of the specified sentence
+<4> [<5>] The amount of time between successive transmissions of the specified
+sentence, in tenths of a second. For example, if field <4> contains the
+value 5, this specifies an interval of 0.5 seconds between successive
+transmissions of the specified sentence. Value is 0-250, 0 to 25 seconds
+by tenths.
+If field <2> is the ALL identifier, then field <4> specifies the
+transmission interval for all sentences.
+Optional field used to specify the amount of time between successive
+65
+transmissions of the specified sentence in a new high precision format.
+This field is only used when field <4> is Null. The format is “m:ss.hh”.
+Where ‘m’ is minutes (0-174), ‘s’ is seconds (0-10440), and ‘hh’ is
+decimal seconds (0-99). The maximum number of hundredths of
+seconds is 1044013. Once the number of seconds is >= 60, the decimal
+seconds are ignored.
+The query outputs 2 numbers, the interval in tenths of seconds and the
+interval in the m:ss.hh format. Some truncation will occur in the
+former, if the interval is not a multiple of tenths of seconds.
+If the interval is less than 26 seconds and a multiple of tenths of
+seconds, the last field of the query (m:ss.hh) is dropped.
+For example,
+if field <5> contains
+this value
+The interval is Output of Query,
+tenths,m:ss.hh
+5 5 seconds 50
+5.50 5.5 seconds 55
+59.50 59.5 seconds 595,000:59.50
+1:30 1 minute, 30 seconds 900,001:30.00
+6000 6000 seconds 60000,100:00.00
+0:30.25 30.25 seconds 302,000:30.25
+25 25 seconds 250
+25.55 25.55 seconds 255,000:25.55
+26 26 seconds 260,000:26.00
+If field <2> is the ALL identifier, then field <5> specifies the transmission
+interval for all sentences.
+Notes
+While hundredths of seconds can be specified, the WX Series of WeatherStation
+Sensors is limited to .05 second granularity.
+The factory default settings are as follows:
+Sentence ID Enabled by default? Default Transmission Interval
+DTM No 0:1.00
+GGA Yes 0:1.00
+GLL No 0:1.00
+GSA No 0:1.00
+GSV No 0:1.00
+HDG Yes 0:1.00
+HDT No 0:1.00
+66
+MDA Yes 0:1.00
+MWD No 0:1.00
+MWV (R) Yes 0:1.00
+MWV (T) No 0:1.00
+RMC Yes 0:1.00
+ROT No 0:1.00
+VTG No 0:1.00
+VWR No 0:1.00
+VWT No 0:1.00
+XDR (A) Yes 0:1.00
+XDR (B) Yes 0:1.00
+XDR (C) No 0:1.00
+XDR (D) Yes 0:1.00
+XDR (E) No 0:1.00
+XDR (H) No 0:1.00
+XDR (T) No 0:1.00
+XDR (W) No 0:1.00
+ZDA No 0:1.00
+Build the above table from the control file.
+Note that the MWV sentence appears in two forms: relative (R) and theoretical (T).
+These two forms are enabled separately.
+Also note that the XDR sentence appears in multiple. These forms are also enabled
+separately.
+If field <3> is a null field, then that field will remain unchanged from its previous value.
+If both field <4> and <5> are null fields, then the interval will remain unchanged from its
+previous value.
+The selections as to which sentences are enabled for transmission, and the rate at which
+each sentence is transmitted, are stored in nonvolatile EEPROM memory within the WX
+Series WeatherStation Sensor. On power up, these settings are copied from EEPROM
+into a working copy in RAM memory. It is the working copy in RAM that determines
+the behavior of the WX Series WeatherStation Sensor, with regard to the transmission of
+sentences.
+Any changes to these settings using the $PAMTC,EN,<2>,<3>,<4> command only affect
+the working copy in RAM. When power is lost, the changes to the working copy in
+RAM will be lost.
+The $PAMTC,EN,S command causes the contents of the current working copy in RAM
+to be saved to EEPROM. The saved settings will then be restored to RAM each time
+power is applied to the unit.
+The $PAMTC,EN,L command allows the settings to be reloaded from EEPROM to
+RAM without cycling power to the unit. This can be used to discard any changes made
+67
+AIRMAR® Proprietary and Confidential
+WX Series WeatherStation Technical Manual revision 2.000
+to the working copy in RAM, and restore the saved settings as though the unit had been
+turned off and then back on again.
+The $PAMTC,EN,LD command loads the factory default settings from ROM memory
+into RAM memory.
+Note that the $PAMTC,ERST command (see separate description) differs from the
+$PAMTC,EN,LD command in that $PAMTC,ERST will initialize all of user EEPROM
+memory to its factory default settings. This includes settings unrelated to the selection of
+transmitted sentences

@@ -526,30 +526,34 @@ class WX200:
             logger.info("Suspended all transmissions for configuration")
             time.sleep(0.5)
             
-            # Configure message rates (10Hz maximum as specified in manual)
+            # Configure message rates with CORRECT format (10Hz = 1 tenth of a second)
             all_commands = [
                 # GPS message rates
-                "$PAMTC,EN,GGA,0:0.10",
-                "$PAMTC,EN,RMC,0:0.10",
-                "$PAMTC,EN,VTG,0:0.10",
+                "$PAMTC,EN,GGA,1,1",  # Enable GGA at 0.1s interval (10Hz)
+                "$PAMTC,EN,RMC,1,1",  # Enable RMC at 0.1s interval (10Hz)
+                "$PAMTC,EN,VTG,1,1",  # Enable VTG at 0.1s interval (10Hz)
                 
                 # Compass heading message rates
-                "$PAMTC,EN,HDG,0:0.10",
-                "$PAMTC,EN,HDT,0:0.10",
-                "$PAMTC,EN,THS,0:0.10",
+                "$PAMTC,EN,HDG,1,1",  # Enable HDG at 0.1s interval (10Hz)
+                "$PAMTC,EN,HDT,1,1",  # Enable HDT at 0.1s interval (10Hz)
+                "$PAMTC,EN,THS,1,1",  # Enable THS at 0.1s interval (10Hz)
                 
                 # Wind data message rates
-                "$PAMTC,EN,MWD,0:0.10",
-                "$PAMTC,EN,MWVR,0:0.10",
-                "$PAMTC,EN,VWR,0:0.10",
-                "$PAMTC,EN,VWT,0:0.10"
+                "$PAMTC,EN,MWD,1,1",    # Enable MWD at 0.1s interval (10Hz)
+                "$PAMTC,EN,MWVR,1,1",   # Enable MWVR at 0.1s interval (10Hz)
+                "$PAMTC,EN,VWR,1,1",    # Enable VWR at 0.1s interval (10Hz)
+                "$PAMTC,EN,VWT,1,1"     # Enable VWT at 0.1s interval (10Hz)
             ]
             
             # Send all configuration commands
             for cmd in all_commands:
                 response = self.send_command(cmd)
                 logger.info(f"Command: {cmd} -> Response: {response}")
-                time.sleep(0.2)
+                time.sleep(0.5)  # Slightly longer delay between commands
+            
+            # Save settings to EEPROM so they persist through power cycles
+            save_response = self.send_command("$PAMTC,EN,S")
+            logger.info(f"Save settings command response: {save_response}")
             
             # Step 2: Resume transmissions after configuration is complete
             resume_response = self.send_command("$PAMTX,1")
