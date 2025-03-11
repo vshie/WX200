@@ -410,28 +410,51 @@ class WX200:
             self.send_command(f"$PAMTC,BAUD,{new_baud}")
             logger.info(f"Sent baud rate change command to {new_baud}")
             
-            # 3. Wait for any queued messages
+            # 3. Wait for any queued messages and ensure command is processed
+            time.sleep(2)
+            
+            # 4. Close port properly
+            if self.serial_port:
+                self.serial_port.flush()  # Ensure all data is written
+                self.serial_port.close()
+                self.serial_port = None
+            
+            # 5. Wait for device to complete baud rate change
+            time.sleep(2)
+            
+            # 6. Open new connection at new baud rate
+            try:
+                self.serial_port = serial.Serial(
+                    port=port,
+                    baudrate=new_baud,
+                    timeout=2,  # Increased timeout for stability
+                    write_timeout=2
+                )
+            except Exception as e:
+                logger.error(f"Failed to open port at new baud rate: {str(e)}")
+                return False
+            
+            # 7. Verify port is open
+            if not self.serial_port.is_open:
+                self.serial_port.open()
+            
+            # 8. Clear any buffered data
+            self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
+            
+            # 9. Wait for device to stabilize at new rate
             time.sleep(1)
             
-            # 4. Close and reopen port with new baud rate
-            self.serial_port.close()
-            time.sleep(0.5)
+            # 10. Re-enable periodic transmissions and verify communication
+            for _ in range(3):  # Try up to 3 times
+                response = self.send_command("$PAMTX,1")
+                if response and ('$' in response):  # Verify we got a valid NMEA response
+                    logger.info("Re-enabled periodic transmissions at new baud rate")
+                    return True
+                time.sleep(0.5)
             
-            self.serial_port = serial.Serial(
-                port=port,
-                baudrate=new_baud,
-                timeout=1
-            )
-            
-            # 5. Re-enable periodic transmissions at new baud rate
-            time.sleep(0.5)  # Give device time to stabilize at new rate
-            response = self.send_command("$PAMTX,1")
-            if response:
-                logger.info("Re-enabled periodic transmissions at new baud rate")
-                return True
-            else:
-                logger.error("Failed to re-enable transmissions at new baud rate")
-                return False
+            logger.error("Failed to re-enable transmissions at new baud rate")
+            return False
             
         except Exception as e:
             logger.error(f"Baud rate change error: {str(e)}")
