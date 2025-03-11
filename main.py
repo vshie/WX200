@@ -77,8 +77,14 @@ class WX200:
                         logger.info("Attempting auto-reconnect...")
                         self.connect(self.default_port)
                 elif self.serial_port and self.serial_port.in_waiting:
-                    line = self.serial_port.readline().decode().strip()
-                    self.parse_nmea(line)
+                    try:
+                        # Use errors='replace' to handle non-UTF-8 characters
+                        line = self.serial_port.readline().decode('utf-8', errors='replace').strip()
+                        if line:  # Only process non-empty lines
+                            self.parse_nmea(line)
+                    except Exception as e:
+                        logger.error(f"Error reading serial data: {str(e)}")
+                        # Just skip this data and continue
                 else:
                     time.sleep(0.01)  # Small sleep to prevent CPU spinning
             except Exception as e:
@@ -260,14 +266,23 @@ class WX200:
         if not command.endswith('\r\n'):
             command = self.calculate_checksum(command)
         
-        logger.debug(f"Sending command: {command.strip()}")
+        logger.info(f"Sending command: {command.strip()}")
         self.serial_port.write(command.encode())
+        self.serial_port.flush()  # Ensure command is sent immediately
         
         if read_response:
-            time.sleep(0.1)  # Wait for response
-            response = self.serial_port.readline().decode().strip()
-            logger.debug(f"Response: {response}")
-            return response
+            time.sleep(0.5)  # Longer wait for response
+            if self.serial_port.in_waiting > 0:
+                try:
+                    response = self.serial_port.readline().decode('utf-8', errors='replace').strip()
+                    logger.info(f"Response: {response}")
+                    return response
+                except Exception as e:
+                    logger.error(f"Error reading response: {str(e)}")
+                    return None
+            else:
+                logger.warning("No data received in response")
+                return None
         return None
 
     def parse_nmea(self, line):
@@ -402,61 +417,105 @@ class WX200:
     def change_baud_rate(self, port, new_baud):
         """Change baud rate following the manual's sequence"""
         try:
-            # Step 1: Suspend ALL transmissions with a single command
+            # Step 1: Suspend ALL transmissions
+            logger.info("Stopping all transmissions")
             suspend_response = self.send_command("$PAMTX,0")
-            logger.info(f"Suspended all transmissions: {suspend_response}")
+            if not suspend_response:
+                logger.error("No response to transmission stop command")
+                # Try again with longer timeout
+                time.sleep(1)
+                suspend_response = self.send_command("$PAMTX,0") 
+                if not suspend_response:
+                    return False
             
-            # Give device time to finish current transmission and suspend
+            logger.info(f"Suspended all transmissions: {suspend_response}")
             time.sleep(1)
             
-            # Clear any remaining data in the buffer
+            # Step 2: Flush buffers before sending baud rate change command
             self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
             
-            # Step 2: Send baud rate change command
+            # Step 3: Send baud rate change command
             baud_cmd = f"$PAMTC,BAUD,{new_baud}"
-            self.send_command(baud_cmd)
+            self.send_command(baud_cmd, read_response=False)  # Don't wait for response, device changes baud immediately
             logger.info(f"Sent baud rate change command to {new_baud}")
             
-            # Step 3: Flush data and close port
-            time.sleep(1)
+            # Step 4: Close port properly
+            time.sleep(2)  # Wait before closing
             if self.serial_port:
                 self.serial_port.flush()
                 old_port = self.serial_port
                 self.serial_port = None
                 old_port.close()
             
-            # Step 4: Wait for device to process change
+            # Step 5: Wait for device to complete its baud rate change
             time.sleep(3)
             
-            # Step 5: Reopen port with new baud rate
+            # Step 6: Reopen port with new baud rate
             logger.info(f"Reopening port at {new_baud} baud")
             try:
                 self.serial_port = serial.Serial(
                     port=port,
                     baudrate=new_baud,
-                    timeout=2
+                    timeout=3
                 )
             except Exception as e:
                 logger.error(f"Failed to open port at new baud rate: {str(e)}")
                 # Fallback to original baud rate
-                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=1)
+                time.sleep(1)
+                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=2)
                 return False
             
-            time.sleep(1)
+            # Step 7: Wait for port to stabilize
+            time.sleep(2)
             self.serial_port.reset_input_buffer()
+            self.serial_port.reset_output_buffer()
             
-            # Step 6: Verify communication at new baud rate with a simple query
-            test_response = self.send_command("$PAMTC,QP")
-            if not test_response or ('$' not in test_response):
-                logger.error(f"Device not responding at {new_baud} baud")
+            # First, resume transmissions immediately at the new baud rate
+            logger.info("Resuming transmissions at new baud rate")
+            resume_cmd = "$PAMTX,1"
+            self.serial_port.write(self.calculate_checksum(resume_cmd).encode())
+            self.serial_port.flush()
+
+            # Give device time to start transmitting
+            time.sleep(2)
+
+            # Now check if we're receiving data, which would confirm both the baud rate change
+            # and the successful resumption of transmissions
+            success = False
+            for attempt in range(5):
+                if self.serial_port.in_waiting > 0:
+                    # Read some data to confirm communication
+                    response = self.serial_port.readline().decode('utf-8', errors='replace').strip()
+                    logger.info(f"Receiving data at {new_baud} baud: {response}")
+                    success = True
+                    break
+                
+                logger.info(f"Waiting for data at {new_baud} baud (attempt {attempt+1}/5)")
+                time.sleep(1)  # Wait between checks
+
+            if not success:
+                logger.error(f"No data received at {new_baud} baud after resuming transmissions")
+                # Try to reopen at original baud rate
+                if self.serial_port:
+                    self.serial_port.close()
+                time.sleep(1)
+                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=2)
                 return False
-            
-            # Success - device is now at new baud rate but transmissions still suspended
-            logger.info(f"Successfully changed baud rate to {new_baud}")
+
+            logger.info(f"Successfully changed to {new_baud} baud and resumed transmissions")
             return True
             
         except Exception as e:
             logger.error(f"Baud rate change error: {str(e)}")
+            # Attempt recovery
+            try:
+                if self.serial_port:
+                    self.serial_port.close()
+                time.sleep(1)
+                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=2)
+            except:
+                pass
             return False
 
     def configure_device(self):
