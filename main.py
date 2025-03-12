@@ -8,12 +8,9 @@ from flask_cors import CORS
 import threading
 import logging
 import requests
-import json
-from datetime import datetime
-from pymavlink import mavutil
-from pymavlink.dialects.v20 import common as mavlink2
 import os
 import signal
+from queue import Queue, Empty
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,33 +24,16 @@ class WX200:
         self.serial_port = None
         self.connected = False
         self.available_ports = []
-        self.current_data = {}
-        self.data_thread = None
-        self.running = False
         self.DEFAULT_BAUD = 4800
         self.HIGH_BAUD = 38400
-        self.auto_reconnect = True
-        self.last_reconnect_attempt = 0
-        self.reconnect_interval = 5  # seconds
-        self.default_port = "/dev/ttyUSB0"
+        self.running = False
+        self.data_thread = None
         
-        # Initialize MAVLink connection
-        self.mav = mavutil.mavlink_connection(
-            'udpout:host.docker.internal:14550',
-            source_system=1,
-            source_component=mavutil.mavlink.MAV_COMP_ID_PERIPHERAL
-        )
+        # Message buffer for serial terminal
+        self.message_buffer = []
+        self.max_buffer_size = 1000
+        self.new_messages = Queue()
         
-        # Message timing control
-        self.last_wind_send = 0
-        self.last_weather_send = 0
-        self.last_gps_send = 0
-        self.last_attitude_send = 0
-        self.wind_send_interval = 0.2  # 5Hz
-        self.weather_send_interval = 1.0  # 1Hz
-        self.gps_send_interval = 0.2  # 5Hz
-        self.attitude_send_interval = 0.2  # 5Hz
-
         # Start the background process
         self.start_background_process()
 
@@ -67,170 +47,37 @@ class WX200:
             logger.info("Background process started")
 
     def background_process(self):
-        """Main background process that handles connection and data reading"""
+        """Main background process that handles serial data reading"""
         while self.running:
             try:
-                if not self.connected:
-                    current_time = time.time()
-                    if (current_time - self.last_reconnect_attempt) >= self.reconnect_interval:
-                        self.last_reconnect_attempt = current_time
-                        logger.info("Attempting auto-reconnect...")
-                        self.connect(self.default_port)
-                elif self.serial_port and self.serial_port.in_waiting:
+                if self.serial_port and self.serial_port.in_waiting:
                     try:
                         # Use errors='replace' to handle non-UTF-8 characters
                         line = self.serial_port.readline().decode('utf-8', errors='replace').strip()
                         if line:  # Only process non-empty lines
-                            self.parse_nmea(line)
+                            self.add_to_buffer(f"RX: {line}")
                     except Exception as e:
                         logger.error(f"Error reading serial data: {str(e)}")
-                        # Just skip this data and continue
                 else:
                     time.sleep(0.01)  # Small sleep to prevent CPU spinning
             except Exception as e:
                 logger.error(f"Background process error: {str(e)}")
-                self.handle_connection_error()
                 time.sleep(1)  # Delay before retry
 
-    def handle_connection_error(self):
-        """Handle connection errors and cleanup"""
-        if self.serial_port:
-            try:
-                self.serial_port.close()
-            except:
-                pass
-            self.serial_port = None
-        self.connected = False
-        self.current_data = {}
-
-    def send_mavlink_wind(self):
-        """Send wind data via MAVLink"""
-        if 'wind' not in self.current_data:
-            return
-
-        wind = self.current_data['wind']
-        if not all(k in wind for k in ['speed', 'angle', 'status']):
-            return
+    def add_to_buffer(self, message):
+        """Add a message to the terminal buffer"""
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        formatted_message = f"[{timestamp}] {message}"
         
-        # Only send if data is valid
-        if wind['status'] != 'A':
-            return
-
-        current_time = time.time()
-        if current_time - self.last_wind_send < self.wind_send_interval:
-            return
-
-        # Convert wind speed to m/s if needed
-        speed = wind['speed']
-        if wind['speed_units'] == 'N':  # Knots
-            speed *= 0.514444
-        elif wind['speed_units'] == 'K':  # km/h
-            speed *= 0.277778
-        elif wind['speed_units'] == 'M':  # m/s
-            pass  # Already in m/s
-
-        self.mav.mav.wind_send(
-            direction=float(wind['angle']),  # degrees
-            speed=float(speed),  # m/s
-            speed_z=0.0  # m/s
-        )
-        self.last_wind_send = current_time
-
-    def send_mavlink_weather(self):
-        """Send weather data via MAVLink"""
-        if 'meteorological' not in self.current_data:
-            return
-
-        # Skip sending weather data since the MAVLink weather_send method isn't available
-        # Instead, log the weather data if desired
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"Weather data available: {self.current_data['meteorological']}")
+        self.message_buffer.append(formatted_message)
+        # Keep buffer at max size
+        if len(self.message_buffer) > self.max_buffer_size:
+            self.message_buffer.pop(0)
+            
+        # Add to new messages queue for SSE
+        self.new_messages.put(formatted_message)
         
-        # Update last_weather_send to prevent frequent logging attempts
-        self.last_weather_send = time.time()
-
-    def send_mavlink_gps(self):
-        """Send GPS data via MAVLink"""
-        if 'gps' not in self.current_data:
-            return
-
-        gps = self.current_data['gps']
-        current_time = time.time()
-        if current_time - self.last_gps_send < self.gps_send_interval:
-            return
-
-        # Ensure all required fields exist
-        required_fields = ['latitude', 'longitude', 'altitude']
-        if not all(field in gps for field in required_fields):
-            return  # Skip sending if any required field is missing
-
-        try:
-            # Convert to appropriate units and types
-            lat = int(float(gps['latitude']) * 1e7)  # Convert to int32 degE7
-            lon = int(float(gps['longitude']) * 1e7)  # Convert to int32 degE7
-            alt = int(float(gps['altitude']) * 1000)  # Convert to mm
-            hdop = int(float(gps.get('hdop', 0)) * 100)
-            vdop = int(float(gps.get('vdop', 0)) * 100)
-            
-            # Convert speed to m/s if needed
-            speed = float(gps.get('speed', 0))
-            if gps.get('speed_units') == 'N':  # Knots
-                speed *= 0.514444
-            
-            # Get number of satellites
-            sats = int(gps.get('satellites', 0))
-            
-            # Determine fix type
-            fix_type = mavlink2.GPS_FIX_TYPE_NO_GPS
-            if gps.get('fix') == '1':
-                fix_type = mavlink2.GPS_FIX_TYPE_2D_FIX
-            elif gps.get('fix') == '2':
-                fix_type = mavlink2.GPS_FIX_TYPE_3D_FIX
-            
-            self.mav.mav.gps_raw_int_send(
-                time_usec=int(time.time() * 1e6),
-                fix_type=fix_type,
-                lat=lat,
-                lon=lon,
-                alt=alt,
-                eph=hdop,
-                epv=vdop,
-                vel=int(speed * 100),  # cm/s
-                cog=int(float(gps.get('track', 0)) * 100),  # cdeg
-                satellites_visible=sats,
-                alt_ellipsoid=alt,
-                h_acc=hdop,
-                v_acc=vdop,
-                vel_acc=0,
-                hdg_acc=0
-            )
-            self.last_gps_send = current_time
-        except Exception as e:
-            logger.error(f"Error sending MAVLink GPS data: {str(e)}")
-
-    def send_mavlink_attitude(self):
-        """Send compass heading as attitude data via MAVLink"""
-        if 'compass' not in self.current_data:
-            return
-
-        compass = self.current_data['compass']
-        current_time = time.time()
-        if current_time - self.last_attitude_send < self.attitude_send_interval:
-            return
-
-        # Convert heading to radians
-        heading_rad = float(compass['heading']) * 0.0174533
-
-        self.mav.mav.attitude_send(
-            time_boot_ms=int(time.time() * 1000),
-            roll=0,  # Only have heading data
-            pitch=0,  # Only have heading data
-            yaw=heading_rad,
-            rollspeed=0,
-            pitchspeed=0,
-            yawspeed=0
-        )
-        self.last_attitude_send = current_time
+        logger.info(formatted_message)
 
     def get_available_ports(self):
         """List all available serial ports"""
@@ -247,446 +94,120 @@ class WX200:
             checksum ^= ord(char)
         return f"{command}*{checksum:02X}\r\n"
 
-    def send_command(self, command, read_response=True):
-        """Send command and optionally read response"""
+    def send_command(self, command):
+        """Send command to the serial port and log it"""
+        if not self.connected or not self.serial_port:
+            self.add_to_buffer("ERROR: Not connected to device")
+            return False
+            
         if not command.endswith('\r\n'):
             command = self.calculate_checksum(command)
         
-        logger.info(f"Sending command: {command.strip()}")
+        self.add_to_buffer(f"TX: {command.strip()}")
         self.serial_port.write(command.encode())
         self.serial_port.flush()  # Ensure command is sent immediately
-        
-        if read_response:
-            time.sleep(0.5)  # Longer wait for response
-            if self.serial_port.in_waiting > 0:
-                try:
-                    response = self.serial_port.readline().decode('utf-8', errors='replace').strip()
-                    logger.info(f"Response: {response}")
-                    return response
-                except Exception as e:
-                    logger.error(f"Error reading response: {str(e)}")
-                    return None
-            else:
-                logger.warning("No data received in response")
-                return None
-        return None
+        return True
 
-    def parse_nmea(self, line):
-        """Parse NMEA sentences from the device with more robust error handling"""
-        try:
-            if not line or not line.startswith('$'):
-                return
-            
-            parts = line.split(',')
-            if len(parts) < 2:  # Ensure we have at least a sentence type and one data field
-                return
-            
-            sentence_type = parts[0]
-            
-            # Store the raw data and timestamp
-            self.current_data['timestamp'] = time.time()
-            self.current_data['last_sentence'] = sentence_type
-            self.current_data['raw_data'] = line
-            
-            # Parse specific sentence types
-            try:
-                if sentence_type in ['$WIMWV', '$WIVWR']:  # Wind data
-                    self.parse_wind_data(parts)
-                    self.send_mavlink_wind()
-                elif sentence_type == '$WIMDA':  # Meteorological composite
-                    self.parse_meteorological_data(parts)
-                    self.send_mavlink_weather()
-                elif sentence_type == '$GPRMC':  # GPS data
-                    self.parse_gps_rmc(parts)
-                    self.send_mavlink_gps()
-                elif sentence_type == '$GPGGA':  # GPS fix data
-                    self.parse_gps_gga(parts)
-                    self.send_mavlink_gps()
-                elif sentence_type == '$HCHDT':  # Heading data
-                    self.parse_compass_data(parts)
-                    self.send_mavlink_attitude()
-                elif sentence_type == '$GPZDA':  # Time & Date
-                    self.parse_time_data(parts)
-            except Exception as specific_e:
-                # Log specific parsing error but continue with other sentences
-                logger.error(f"Error parsing {sentence_type}: {str(specific_e)}")
-                
-        except Exception as e:
-            logger.error(f"Parse error: {str(e)}")
-
-    def parse_wind_data(self, parts):
-        """Parse wind-related NMEA sentences"""
-        try:
-            if parts[0] == '$WIMWV':  # Wind Speed and Angle
-                self.current_data['wind'] = {
-                    'angle': float(parts[1]) if parts[1] else None,
-                    'reference': parts[2],  # R = Relative, T = True
-                    'speed': float(parts[3]) if parts[3] else None,
-                    'speed_units': parts[4],
-                    'status': parts[5].split('*')[0]  # A = Valid
-                }
-        except Exception as e:
-            logger.error(f"Wind data parse error: {str(e)}")
-
-    def parse_meteorological_data(self, parts):
-        """Parse meteorological composite data"""
-        try:
-            self.current_data['meteorological'] = {
-                'barometric_pressure_inches': float(parts[1]) if parts[1] else None,
-                'barometric_pressure_bars': float(parts[3]) if parts[3] else None,
-                'air_temp_c': float(parts[5]) if parts[5] else None,
-                'water_temp_c': float(parts[7]) if parts[7] else None,
-                'relative_humidity': float(parts[9]) if parts[9] else None,
-                'dew_point_c': float(parts[11]) if parts[11] else None
-            }
-        except Exception as e:
-            logger.error(f"Meteorological data parse error: {str(e)}")
-
-    def parse_time_data(self, parts):
-        """Parse time and date data"""
-        try:
-            if len(parts) >= 4:
-                self.current_data['datetime'] = {
-                    'utc_time': parts[1],
-                    'day': parts[2],
-                    'month': parts[3],
-                    'year': parts[4]
-                }
-        except Exception as e:
-            logger.error(f"Time data parse error: {str(e)}")
-
-    def parse_gps_rmc(self, parts):
-        """Parse GPS RMC data"""
-        try:
-            if len(parts) >= 12:
-                if 'gps' not in self.current_data:
-                    self.current_data['gps'] = {}
-                
-                # Only convert lat/long if all fields are present and non-empty
-                if parts[3] and parts[4] and parts[5] and parts[6] and parts[3] != '' and parts[5] != '':
-                    try:
-                        lat = float(parts[3][:2]) + float(parts[3][2:]) / 60.0
-                        if parts[4] == 'S':
-                            lat = -lat
-                        lon = float(parts[5][:3]) + float(parts[5][3:]) / 60.0
-                        if parts[6] == 'W':
-                            lon = -lon
-                        
-                        self.current_data['gps'].update({
-                            'latitude': lat,
-                            'longitude': lon,
-                            'speed': float(parts[7]) if parts[7] and parts[7] != '' else 0,
-                            'speed_units': 'N',  # Speed is in knots
-                            'track': float(parts[8]) if parts[8] and parts[8] != '' else 0,
-                            'fix': '1' if parts[2] == 'A' else '0'
-                        })
-                    except (ValueError, IndexError) as e:
-                        logger.error(f"Error converting GPS coordinates: {str(e)}")
-        except Exception as e:
-            logger.error(f"GPS RMC parse error: {str(e)}")
-
-    def parse_gps_gga(self, parts):
-        """Parse GPS GGA data"""
-        try:
-            if len(parts) >= 15:
-                if 'gps' not in self.current_data:
-                    self.current_data['gps'] = {}
-                
-                # Safe conversion of values with error checking
-                try:
-                    altitude = float(parts[9]) if parts[9] and parts[9] != '' else 0
-                    hdop = float(parts[8]) if parts[8] and parts[8] != '' else 0
-                    satellites = int(parts[7]) if parts[7] and parts[7] != '' else 0
-                    
-                    self.current_data['gps'].update({
-                        'altitude': altitude,
-                        'altitude_units': parts[10] if parts[10] else 'M',
-                        'hdop': hdop,
-                        'satellites': satellites
-                    })
-                except ValueError as e:
-                    logger.error(f"Error converting GPS data values: {str(e)}")
-        except Exception as e:
-            logger.error(f"GPS GGA parse error: {str(e)}")
-
-    def parse_compass_data(self, parts):
-        """Parse compass heading data"""
-        try:
-            if len(parts) >= 3:
-                self.current_data['compass'] = {
-                    'heading': float(parts[1]) if parts[1] else 0,
-                    'reference': parts[2]  # Should be 'T' for True
-                }
-        except Exception as e:
-            logger.error(f"Compass data parse error: {str(e)}")
-
-    def change_baud_rate(self, port, new_baud):
-        """Change baud rate following the manual's sequence"""
-        try:
-            # Step 1: Suspend ALL transmissions
-            logger.info("Stopping all transmissions")
-            suspend_response = self.send_command("$PAMTX,0")
-            if not suspend_response:
-                logger.error("No response to transmission stop command")
-                # Try again with longer timeout
-                time.sleep(1)
-                suspend_response = self.send_command("$PAMTX,0") 
-                if not suspend_response:
-                    return False
-            
-            logger.info(f"Suspended all transmissions: {suspend_response}")
-            time.sleep(1)
-            
-            # Step 2: Flush buffers before sending baud rate change command
-            self.serial_port.reset_input_buffer()
-            self.serial_port.reset_output_buffer()
-            
-            # Step 3: Send baud rate change command
-            baud_cmd = f"$PAMTC,BAUD,{new_baud}"
-            self.send_command(baud_cmd, read_response=False)  # Don't wait for response, device changes baud immediately
-            logger.info(f"Sent baud rate change command to {new_baud}")
-            
-            # Step 4: Close port properly
-            time.sleep(2)  # Wait before closing
-            if self.serial_port:
-                self.serial_port.flush()
-                old_port = self.serial_port
-                self.serial_port = None
-                old_port.close()
-            
-            # Step 5: Wait for device to complete its baud rate change
-            time.sleep(3)
-            
-            # Step 6: Reopen port with new baud rate
-            logger.info(f"Reopening port at {new_baud} baud")
-            try:
-                self.serial_port = serial.Serial(
-                    port=port,
-                    baudrate=new_baud,
-                    timeout=3
-                )
-            except Exception as e:
-                logger.error(f"Failed to open port at new baud rate: {str(e)}")
-                # Fallback to original baud rate
-                time.sleep(1)
-                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=2)
-                return False
-            
-            # Step 7: Wait for port to stabilize
-            time.sleep(2)
-            self.serial_port.reset_input_buffer()
-            self.serial_port.reset_output_buffer()
-            
-            # First, resume transmissions immediately at the new baud rate
-            logger.info("Resuming transmissions at new baud rate")
-            resume_cmd = "$PAMTX,1"
-            self.serial_port.write(self.calculate_checksum(resume_cmd).encode())
-            self.serial_port.flush()
-
-            # Give device time to start transmitting
-            time.sleep(2)
-
-            # Now check if we're receiving data, which would confirm both the baud rate change
-            # and the successful resumption of transmissions
-            success = False
-            for attempt in range(5):
-                if self.serial_port.in_waiting > 0:
-                    # Read some data to confirm communication
-                    response = self.serial_port.readline().decode('utf-8', errors='replace').strip()
-                    logger.info(f"Receiving data at {new_baud} baud: {response}")
-                    success = True
-                    break
-                
-                logger.info(f"Waiting for data at {new_baud} baud (attempt {attempt+1}/5)")
-                time.sleep(1)  # Wait between checks
-
-            if not success:
-                logger.error(f"No data received at {new_baud} baud after resuming transmissions")
-                # Try to reopen at original baud rate
-                if self.serial_port:
-                    self.serial_port.close()
-                time.sleep(1)
-                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=2)
-                return False
-
-            logger.info(f"Successfully changed to {new_baud} baud and resumed transmissions")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Baud rate change error: {str(e)}")
-            # Attempt recovery
-            try:
-                if self.serial_port:
-                    self.serial_port.close()
-                time.sleep(1)
-                self.serial_port = serial.Serial(port=port, baudrate=self.DEFAULT_BAUD, timeout=2)
-            except:
-                pass
-            return False
-
-    def configure_device(self):
-        """Configure WX200 for optimal performance"""
-        if not self.connected:
-            return False
-        
-        try:
-            # Make sure we can communicate first
-            query_response = self.send_command("$PAMTC,EN,Q")
-            logger.info(f"Current settings query: {query_response}")
-            
-            # Step 1: Make sure transmissions are suspended for configuration
-            self.send_command("$PAMTX,0")
-            logger.info("Suspended all transmissions for configuration")
-            time.sleep(1.0)  # Give more time to process
-            
-            # Force input buffer clear
-            self.serial_port.reset_input_buffer()
-            
-            # Use a more conservative rate (5Hz = interval of 2 in tenths of seconds)
-            all_commands = [
-                # GPS message rates - more important data
-                "$PAMTC,EN,GGA,1,2",  # Enable at 0.2s interval (5Hz)
-                "$PAMTC,EN,RMC,1,2",  # Enable at 0.2s interval (5Hz)
-                
-                # Wind data - most important
-                "$PAMTC,EN,MWVR,1,2",  # Enable at 0.2s interval (5Hz)
-                
-                # Less important data, slower rate
-                "$PAMTC,EN,VTG,1,5",   # 0.5s interval (2Hz)
-                "$PAMTC,EN,HDG,1,5",   # 0.5s interval (2Hz)
-                "$PAMTC,EN,HDT,1,5",   # 0.5s interval (2Hz)
-                "$PAMTC,EN,MWD,1,5",   # 0.5s interval (2Hz)
-            ]
-            
-            # Send commands with longer timeout and better error handling
-            for cmd in all_commands:
-                for attempt in range(3):  # Try each command up to 3 times
-                    self.serial_port.reset_input_buffer()  # Clear any pending data
-                    response = self.send_command(cmd)
-                    logger.info(f"Command: {cmd} -> Response: {response}")
-                    
-                    # If we get a proper NMEA response (starts with $), consider it successful
-                    if response and response.startswith('$'):
-                        break
-                        
-                    time.sleep(1.0)  # Wait longer between retries
-            
-            # Save to EEPROM with multiple attempts
-            for attempt in range(3):
-                self.serial_port.reset_input_buffer()
-                save_response = self.send_command("$PAMTC,EN,S")
-                logger.info(f"Save settings (attempt {attempt+1}): {save_response}")
-                if save_response and save_response.startswith('$'):
-                    break
-                time.sleep(1.0)
-            
-            # Resume transmissions with multiple attempts
-            for attempt in range(3):
-                resume_response = self.send_command("$PAMTX,1")
-                logger.info(f"Resume transmissions (attempt {attempt+1}): {resume_response}")
-                if resume_response and resume_response.startswith('$'):
-                    break
-                time.sleep(1.0)
-            
-            # Check if we're actually receiving data at the expected rate
-            logger.info("Waiting to verify data reception...")
-            time.sleep(3)
-            received_count = 0
-            start_time = time.time()
-            for _ in range(10):  # Check for data for 1 second
-                if self.serial_port.in_waiting > 0:
-                    response = self.serial_port.readline().decode('utf-8', errors='replace').strip()
-                    if response.startswith('$'):
-                        received_count += 1
-                        logger.info(f"Received: {response}")
-                time.sleep(0.1)
-            
-            rate = received_count / (time.time() - start_time)
-            logger.info(f"Receiving data at approximately {rate:.1f} Hz")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Configuration error: {str(e)}")
-            # Try to resume transmissions even if configuration failed
-            try:
-                self.send_command("$PAMTX,1")
-            except:
-                pass
-            return False
-
-    def connect(self, port="/dev/ttyUSB0"):
+    def connect(self, port, baud=None):
         """Connect to the WX200 device"""
         try:
             if self.serial_port:
                 self.disconnect()
             
-            self.default_port = port
+            if baud is None:
+                baud = self.DEFAULT_BAUD
+                
+            self.add_to_buffer(f"Connecting to {port} at {baud} baud...")
             
             # Use 8-N-1 configuration explicitly
-            logger.info(f"Connecting at initial baud rate: {self.DEFAULT_BAUD}")
             self.serial_port = serial.Serial(
                 port=port,
-                baudrate=self.DEFAULT_BAUD,
+                baudrate=baud,
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 timeout=1
             )
-            time.sleep(0.5)
             
             # Flush buffers at startup
             self.serial_port.reset_input_buffer()
             self.serial_port.reset_output_buffer()
             
-            # Try a few basic commands to establish communication
-            for _ in range(3):
-                test_response = self.send_command("$PAMTC,QP")
-                if test_response and not "ï¿½" in test_response:
-                    break
-                time.sleep(1)
-                self.serial_port.reset_input_buffer()
-            
-            if not test_response or "ï¿½" in test_response:
-                logger.error("No valid response from device at default baud rate")
-                self.disconnect()
-                return False
-            
-            # Try to increase baud rate
-            logger.info("Testing communication successful, attempting to increase baud rate")
-            if self.change_baud_rate(port, self.HIGH_BAUD):
-                self.connected = True
-                logger.info(f"Connected to {port} at {self.HIGH_BAUD} baud")
-                
-                # Configure device for optimal performance
-                if self.configure_device():
-                    return True
-                else:
-                    logger.error("Failed to configure device")
-                    self.disconnect()
-                    return False
-            else:
-                logger.error("Failed to set high baud rate")
-                self.disconnect()
-                return False
+            self.connected = True
+            self.add_to_buffer(f"Connected to {port} at {baud} baud")
+            return True
                 
         except Exception as e:
-            logger.error(f"Connection error: {str(e)}")
+            error_msg = f"Connection error: {str(e)}"
+            logger.error(error_msg)
+            self.add_to_buffer(f"ERROR: {error_msg}")
             self.connected = False
             return False
+
+    def change_baud_rate(self, new_baud):
+        """Change baud rate manually"""
+        if not self.connected or not self.serial_port:
+            self.add_to_buffer("ERROR: Not connected to device")
+            return False
+
+        try:
+            port = self.serial_port.port
+            # Step 1: Suspend ALL transmissions
+            self.add_to_buffer("Stopping all transmissions")
+            self.send_command("$PAMTX,0")
+            time.sleep(1)
+            
+            # Step 2: Send baud rate change command
+            baud_cmd = f"$PAMTC,BAUD,{new_baud}"
+            self.send_command(baud_cmd)
+            self.add_to_buffer(f"Sent baud rate change command to {new_baud}")
+            
+            # Step 3: Close port
+            time.sleep(2)
+            if self.serial_port:
+                self.serial_port.close()
+                self.serial_port = None
+                self.connected = False
+            
+            # Step 4: Wait for device to change baud
+            time.sleep(3)
+            
+            # Step 5: Reconnect at new baud rate
+            return self.connect(port, new_baud)
+            
+        except Exception as e:
+            error_msg = f"Baud rate change error: {str(e)}"
+            logger.error(error_msg)
+            self.add_to_buffer(f"ERROR: {error_msg}")
+            return False
+
+    def stop_transmissions(self):
+        """Stop transmissions from the device"""
+        return self.send_command("$PAMTX,0")
+
+    def start_transmissions(self):
+        """Start transmissions from the device"""
+        return self.send_command("$PAMTX,1")
+
+    def set_message_rate(self, message_type, rate):
+        """Set the rate for a specific message type
+        rate is in tenths of seconds (1 = 0.1s or 10Hz)"""
+        return self.send_command(f"$PAMTC,EN,{message_type},1,{rate}")
 
     def disconnect(self):
         """Disconnect from the device"""
         if self.serial_port:
             # Try to set back to default baud rate before disconnecting
             try:
-                self.send_command("$PAMTC,BAUD,4800", read_response=False)
+                self.send_command("$PAMTC,BAUD,4800")
             except:
                 pass
+                
             self.serial_port.close()
             self.serial_port = None
+            
         self.connected = False
-        logger.info("Disconnected from device")
+        self.add_to_buffer("Disconnected from device")
 
 # Create global instance
 wx200 = WX200()
@@ -721,13 +242,70 @@ def disconnect():
     wx200.disconnect()
     return jsonify({"success": True})
 
-@app.route('/api/data')
-def get_data():
-    """Get current data"""
+@app.route('/api/status')
+def get_status():
+    """Get current connection status"""
     return jsonify({
         "connected": wx200.connected,
-        "data": wx200.current_data
+        "port": wx200.serial_port.port if wx200.serial_port else None,
+        "baud": wx200.serial_port.baudrate if wx200.serial_port else None
     })
+
+@app.route('/api/terminal')
+def get_terminal():
+    """Get terminal buffer history"""
+    return jsonify(wx200.message_buffer)
+
+@app.route('/api/terminal/events')
+def terminal_events():
+    """Server-sent events for terminal updates"""
+    def generate():
+        while True:
+            try:
+                message = wx200.new_messages.get(timeout=30)
+                yield f"data: {message}\n\n"
+            except Empty:
+                yield "data: ping\n\n"  # Keep connection alive
+            
+    return Response(generate(), mimetype='text/event-stream')
+
+@app.route('/api/send', methods=['POST'])
+def send_command():
+    """Send a command to the device"""
+    command = request.json.get('command')
+    if not command:
+        return jsonify({"success": False, "error": "No command provided"})
+    
+    success = wx200.send_command(command)
+    return jsonify({"success": success})
+
+@app.route('/api/baud/change/<int:baud>')
+def change_baud(baud):
+    """Change the baud rate"""
+    success = wx200.change_baud_rate(baud)
+    return jsonify({"success": success})
+
+@app.route('/api/transmissions/stop')
+def stop_transmissions():
+    """Stop device transmissions"""
+    success = wx200.stop_transmissions()
+    return jsonify({"success": success})
+
+@app.route('/api/transmissions/start')
+def start_transmissions():
+    """Start device transmissions"""
+    success = wx200.start_transmissions()
+    return jsonify({"success": success})
+
+@app.route('/api/message/rate', methods=['POST'])
+def set_message_rate():
+    """Set message rate for specific type"""
+    data = request.json
+    if not data or 'type' not in data or 'rate' not in data:
+        return jsonify({"success": False, "error": "Missing type or rate"})
+    
+    success = wx200.set_message_rate(data['type'], data['rate'])
+    return jsonify({"success": success})
 
 @app.route('/register')
 def register_service():
@@ -743,30 +321,10 @@ def register_service():
         "route": "/wx200"
     })
 
-@app.route('/v1.0/docs')
-def swagger_docs():
-    """Provide API documentation."""
-    return jsonify({
-        "openapi": "3.0.0",
-        "info": {
-            "title": "WX200 Weather Station API",
-            "version": "1.0.0"
-        },
-        "paths": {}
-    })
-
 @app.route('/favicon.ico')
 def favicon():
     """Serve favicon to prevent 404 errors."""
     return send_from_directory('static', 'favicon.ico') if os.path.exists('static/favicon.ico') else ('', 204)
-
-@app.route('/version')
-def version():
-    """Return version information."""
-    return jsonify({
-        "version": "0.1.0",
-        "name": "wx200"
-    })
 
 @app.route('/')
 def index():
@@ -777,18 +335,6 @@ def index():
 def static_files(path):
     """Serve static files."""
     return send_from_directory('frontend', path)
-
-def register_with_blueos():
-    """Actively register with BlueOS at startup"""
-    try:
-        # Try to register with BlueOS core on localhost
-        response = requests.get("http://localhost:8080/register")
-        logger.info(f"BlueOS registration attempt: {response.status_code}")
-    except Exception as e:
-        logger.error(f"Failed to register with BlueOS: {str(e)}")
-
-# Run the registration attempt in a separate thread at startup
-threading.Thread(target=register_with_blueos, daemon=True).start()
 
 if __name__ == '__main__':
     # Start the Flask app

@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WX200 Weather Station</title>
+    <title>WX200 Weather Station Terminal</title>
     <style>
         body {
-            font-family: Arial, sans-serif;
-            max-width: 800px;
+            font-family: 'Courier New', monospace;
+            max-width: 1000px;
             margin: 0 auto;
             padding: 20px;
             background-color: #f5f5f5;
@@ -22,6 +22,7 @@
             padding: 10px;
             margin: 10px 0;
             border-radius: 4px;
+            font-weight: bold;
         }
         .connected {
             background-color: #d4edda;
@@ -31,11 +32,12 @@
             background-color: #f8d7da;
             color: #721c24;
         }
-        select, button {
+        select, button, input {
             padding: 8px;
             margin: 5px;
             border-radius: 4px;
             border: 1px solid #ddd;
+            font-family: 'Courier New', monospace;
         }
         button {
             background-color: #007bff;
@@ -50,41 +52,111 @@
             background-color: #ccc;
             cursor: not-allowed;
         }
-        #dataDisplay {
-            margin-top: 20px;
+        .command-box {
+            display: flex;
+            margin: 10px 0;
+            width: 100%;
+        }
+        .command-input {
+            flex-grow: 1;
+            margin-right: 5px;
+        }
+        .terminal {
+            height: 400px;
+            overflow-y: auto;
+            background-color: #000;
+            color: #00ff00;
             padding: 10px;
+            font-family: 'Courier New', monospace;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .control-panel {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .panel-section {
             border: 1px solid #ddd;
+            padding: 10px;
             border-radius: 4px;
             background-color: #f8f9fa;
+        }
+        .section-title {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        .auto-scroll {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+        }
+        .auto-scroll input {
+            margin-right: 5px;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>WX200 Weather Station</h1>
+        <h1>WX200 Weather Station Terminal</h1>
         
         <div id="connectionStatus" class="status disconnected">
             Status: Disconnected
         </div>
 
-        <div>
-            <select id="portSelect">
-                <option value="">Select Port</option>
-            </select>
-            <button id="refreshPorts">Refresh Ports</button>
-            <button id="connectButton">Connect</button>
-            <button id="disconnectButton" disabled>Disconnect</button>
+        <div class="control-panel">
+            <div class="panel-section">
+                <h4 class="section-title">Connection</h4>
+                <select id="portSelect">
+                    <option value="">Select Port</option>
+                </select>
+                <button id="refreshPorts">Refresh</button>
+                <button id="connectButton">Connect</button>
+                <button id="disconnectButton" disabled>Disconnect</button>
+            </div>
+            
+            <div class="panel-section">
+                <h4 class="section-title">Baud Rate</h4>
+                <button id="changeBaud" disabled>Change to 38400</button>
+            </div>
+            
+            <div class="panel-section">
+                <h4 class="section-title">Transmissions</h4>
+                <button id="stopTx" disabled>Stop</button>
+                <button id="startTx" disabled>Start</button>
+            </div>
+            
+            <div class="panel-section">
+                <h4 class="section-title">Message Rates (5Hz)</h4>
+                <button id="rateGGA" disabled>GGA</button>
+                <button id="rateRMC" disabled>RMC</button>
+                <button id="rateMWVR" disabled>MWVR</button>
+                <button id="rateHDG" disabled>HDG</button>
+                <button id="rateHDT" disabled>HDT</button>
+            </div>
         </div>
-
-        <div id="dataDisplay">
-            <h3>Latest Data</h3>
-            <pre id="rawData">No data available</pre>
+        
+        <div class="command-box">
+            <input type="text" id="commandInput" class="command-input" placeholder="Enter NMEA command (e.g., $PAMTC,QP)">
+            <button id="sendCommand" disabled>Send</button>
+        </div>
+        
+        <div class="terminal" id="terminal"></div>
+        
+        <div class="auto-scroll">
+            <input type="checkbox" id="autoScroll" checked>
+            <label for="autoScroll">Auto-scroll terminal</label>
         </div>
     </div>
 
     <script>
         const API_BASE = window.location.origin + '/api';
         let isConnected = false;
+        let eventSource = null;
 
         // DOM elements
         const portSelect = document.getElementById('portSelect');
@@ -92,7 +164,22 @@
         const disconnectButton = document.getElementById('disconnectButton');
         const refreshPortsButton = document.getElementById('refreshPorts');
         const connectionStatus = document.getElementById('connectionStatus');
-        const rawData = document.getElementById('rawData');
+        const terminal = document.getElementById('terminal');
+        const commandInput = document.getElementById('commandInput');
+        const sendCommandButton = document.getElementById('sendCommand');
+        const changeBaudButton = document.getElementById('changeBaud');
+        const stopTxButton = document.getElementById('stopTx');
+        const startTxButton = document.getElementById('startTx');
+        const autoScrollCheckbox = document.getElementById('autoScroll');
+
+        // Rate buttons
+        const rateButtons = {
+            gga: document.getElementById('rateGGA'),
+            rmc: document.getElementById('rateRMC'),
+            mwvr: document.getElementById('rateMWVR'),
+            hdg: document.getElementById('rateHDG'),
+            hdt: document.getElementById('rateHDT')
+        };
 
         // Fetch available ports
         async function fetchPorts() {
@@ -112,6 +199,7 @@
                 });
             } catch (error) {
                 console.error('Error fetching ports:', error);
+                addTerminalLine(`Error fetching ports: ${error.message}`);
             }
         }
 
@@ -125,12 +213,12 @@
                 const result = await response.json();
                 
                 if (result.success) {
-                    isConnected = true;
                     updateConnectionStatus(true);
-                    startDataPolling();
+                    setupEventSource();
                 }
             } catch (error) {
                 console.error('Connection error:', error);
+                addTerminalLine(`Connection error: ${error.message}`);
                 updateConnectionStatus(false);
             }
         }
@@ -139,11 +227,97 @@
         async function disconnect() {
             try {
                 await fetch(`${API_BASE}/disconnect`);
-                isConnected = false;
                 updateConnectionStatus(false);
-                stopDataPolling();
+                closeEventSource();
             } catch (error) {
                 console.error('Disconnect error:', error);
+                addTerminalLine(`Disconnect error: ${error.message}`);
+            }
+        }
+
+        // Change baud rate
+        async function changeBaud() {
+            try {
+                const response = await fetch(`${API_BASE}/baud/change/38400`);
+                const result = await response.json();
+                if (!result.success) {
+                    addTerminalLine('Failed to change baud rate');
+                }
+            } catch (error) {
+                console.error('Baud rate change error:', error);
+                addTerminalLine(`Baud rate change error: ${error.message}`);
+            }
+        }
+
+        // Stop transmissions
+        async function stopTransmissions() {
+            try {
+                const response = await fetch(`${API_BASE}/transmissions/stop`);
+                const result = await response.json();
+                if (!result.success) {
+                    addTerminalLine('Failed to stop transmissions');
+                }
+            } catch (error) {
+                console.error('Stop error:', error);
+                addTerminalLine(`Stop error: ${error.message}`);
+            }
+        }
+
+        // Start transmissions
+        async function startTransmissions() {
+            try {
+                const response = await fetch(`${API_BASE}/transmissions/start`);
+                const result = await response.json();
+                if (!result.success) {
+                    addTerminalLine('Failed to start transmissions');
+                }
+            } catch (error) {
+                console.error('Start error:', error);
+                addTerminalLine(`Start error: ${error.message}`);
+            }
+        }
+
+        // Set message rate
+        async function setMessageRate(type, rate = 2) {
+            try {
+                const response = await fetch(`${API_BASE}/message/rate`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ type, rate })
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    addTerminalLine(`Failed to set ${type} rate`);
+                }
+            } catch (error) {
+                console.error('Rate setting error:', error);
+                addTerminalLine(`Rate setting error: ${error.message}`);
+            }
+        }
+
+        // Send custom command
+        async function sendCommand() {
+            const command = commandInput.value.trim();
+            if (!command) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/send`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ command })
+                });
+                const result = await response.json();
+                if (!result.success) {
+                    addTerminalLine('Failed to send command');
+                }
+                commandInput.value = '';
+            } catch (error) {
+                console.error('Command error:', error);
+                addTerminalLine(`Command error: ${error.message}`);
             }
         }
 
@@ -155,42 +329,107 @@
             connectButton.disabled = connected;
             disconnectButton.disabled = !connected;
             portSelect.disabled = connected;
-        }
-
-        let dataPollingInterval;
-
-        // Start polling for data
-        function startDataPolling() {
-            dataPollingInterval = setInterval(async () => {
-                try {
-                    const response = await fetch(`${API_BASE}/data`);
-                    const data = await response.json();
-                    
-                    if (!data.connected) {
-                        updateConnectionStatus(false);
-                        stopDataPolling();
-                        return;
-                    }
-
-                    rawData.textContent = JSON.stringify(data.data, null, 2);
-                } catch (error) {
-                    console.error('Error polling data:', error);
-                }
-            }, 1000);
-        }
-
-        // Stop polling for data
-        function stopDataPolling() {
-            if (dataPollingInterval) {
-                clearInterval(dataPollingInterval);
-                rawData.textContent = 'No data available';
+            sendCommandButton.disabled = !connected;
+            changeBaudButton.disabled = !connected;
+            stopTxButton.disabled = !connected;
+            startTxButton.disabled = !connected;
+            
+            // Enable/disable rate buttons
+            for (const button of Object.values(rateButtons)) {
+                button.disabled = !connected;
             }
+        }
+
+        // Setup Server-Sent Events for terminal updates
+        function setupEventSource() {
+            if (eventSource) {
+                closeEventSource();
+            }
+            
+            // Retrieve terminal history first
+            fetch(`${API_BASE}/terminal`)
+                .then(response => response.json())
+                .then(history => {
+                    terminal.innerHTML = '';
+                    history.forEach(line => {
+                        addTerminalLine(line, false);
+                    });
+                    scrollTerminal();
+                    
+                    // Now set up SSE for new updates
+                    eventSource = new EventSource(`${API_BASE}/terminal/events`);
+                    eventSource.onmessage = function(event) {
+                        if (event.data !== 'ping') {
+                            addTerminalLine(event.data);
+                        }
+                    };
+                    eventSource.onerror = function() {
+                        closeEventSource();
+                        setTimeout(setupEventSource, 5000); // Retry connection
+                    };
+                })
+                .catch(error => {
+                    console.error('Error retrieving terminal history:', error);
+                });
+        }
+
+        // Close SSE connection
+        function closeEventSource() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+        }
+
+        // Add line to terminal
+        function addTerminalLine(text, shouldScroll = true) {
+            const line = document.createElement('div');
+            line.textContent = text;
+            terminal.appendChild(line);
+            
+            // Keep terminal buffer size manageable
+            while (terminal.childNodes.length > 1000) {
+                terminal.removeChild(terminal.firstChild);
+            }
+            
+            if (shouldScroll && autoScrollCheckbox.checked) {
+                scrollTerminal();
+            }
+        }
+
+        // Scroll terminal to bottom
+        function scrollTerminal() {
+            terminal.scrollTop = terminal.scrollHeight;
         }
 
         // Event listeners
         refreshPortsButton.addEventListener('click', fetchPorts);
         connectButton.addEventListener('click', connect);
         disconnectButton.addEventListener('click', disconnect);
+        changeBaudButton.addEventListener('click', changeBaud);
+        stopTxButton.addEventListener('click', stopTransmissions);
+        startTxButton.addEventListener('click', startTransmissions);
+        
+        sendCommandButton.addEventListener('click', sendCommand);
+        commandInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendCommand();
+            }
+        });
+        
+        // Rate button listeners
+        rateButtons.gga.addEventListener('click', () => setMessageRate('GGA'));
+        rateButtons.rmc.addEventListener('click', () => setMessageRate('RMC'));
+        rateButtons.mwvr.addEventListener('click', () => setMessageRate('MWVR'));
+        rateButtons.hdg.addEventListener('click', () => setMessageRate('HDG'));
+        rateButtons.hdt.addEventListener('click', () => setMessageRate('HDT'));
+        
+        // Auto-scroll checkbox
+        autoScrollCheckbox.addEventListener('change', function() {
+            if (this.checked) {
+                scrollTerminal();
+            }
+        });
 
         // Initial port fetch
         fetchPorts();
